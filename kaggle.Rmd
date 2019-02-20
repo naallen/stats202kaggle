@@ -1,0 +1,201 @@
+---
+title: "Stats 202 Kaggle Competition"
+author: "Nicholas Allen"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    includes:
+      in_header: ../knitrpreamble.tex
+    keep_tex: yes
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+---
+
+First import CSV file:
+
+```{r}
+train.data = read.csv("train_data.csv", header = TRUE)
+test.data = read.csv("test_data.csv", header = TRUE)
+```
+
+Next, visualize the data to see what useful relationships there could be:
+
+```{r}
+library(ggplot2)
+ggplot(data = melted, aes(y=Status, x=value)) +
+  geom_point(alpha=0.03) +
+  stat_smooth(aes(color = predictor), method = "gam", formula = y ~ s(x), show.legend = FALSE) + 
+  facet_wrap(predictor ~ . )
+```
+
+After fitting a GAM to each of the variables and visualizing the results, we can see which variables are best correlated with Status. The variables with the strongest correlation are age, gold_standard, and assay. BP, smoking, and cholesterol seem to also be correlated, but more weakly. BMI, old_assay, and alcohol have very weak or no correlations. Additionally, smoking and assay seem to have non-linear fits, meaning it would be best to use spline functions for these.
+
+```{r}
+library(leaps)
+regfit.full=regsubsets(Status~., train.data)
+summary(regfit.full)
+```
+
+Looking at best subsets selection affirms the visual examination of the data. Moving forward, I will consider only the 6-variable subset consisting of BP, smoking, behavior, age, gold_standard, and assay. 
+
+```{r}
+library(gam)
+nfolds = 10
+# Perform cross-validation
+folds = rep(1:nfolds, length.out=nrow(train.data))
+
+mean.error = 0
+for (i in 1:nfolds) {
+  testfold = train.data[folds == i,]
+  trainfold = train.data[folds != i,]
+  fit = gam(Status~BP+s(smoking)+behavior+age+gold_standard+s(assay)+s(alcohol), family="binomial", data=trainfold)
+  fit.pred = predict(fit, testfold, type="response")
+  fit.pred = as.numeric(fit.pred > 0.5)
+  mean.error = mean.error + mean(fit.pred == testfold$Status) / nfolds
+}
+
+print(sprintf("Mean error: %s", mean.error))
+```
+
+Next, I want to improve the fit by varying the degrees of freedom for the spline functions for smoking and assay.
+
+```{r}
+nfolds = 10
+nvary = 5
+# Perform cross-validation
+folds = rep(1:nfolds, length.out=nrow(train.data))
+
+fits = c()
+
+for (dfsm in 1:nvary) {
+  for (dfas in 1:nvary) {
+    mean.error = 0
+    for (i in 1:nfolds) {
+      testfold = train.data[folds == i,]
+      trainfold = train.data[folds != i,]
+      fit = gam(Status~BP+s(smoking, dfsm)+behavior+age+gold_standard+s(assay, dfas)+s(alcohol), family="binomial", data=trainfold)
+      fits = c(fits, fit)
+      fit.pred = predict(fit, testfold, type="response")
+      fit.pred = as.numeric(fit.pred > 0.5)
+      mean.error = mean.error + mean(fit.pred == testfold$Status) / nfolds
+    }
+    print(sprintf("Mean error: %s, df for smoking: %s, df for assay: %s", mean.error, dfsm, dfas))
+  }
+}
+```
+
+```{r}
+fit = gam(Status~BP+s(smoking, 7)+behavior+age+gold_standard+s(assay, 7), family="binomial", data=trainfold)
+summary(fit)
+pred.test = predict(fit, test.data, type="response") > 0.5
+
+retdf = data.frame(test.data$Id, as.logical(pred.test))
+names(retdf) = c("Id", "Category")
+write.csv(retdf, "predictions.csv", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+nfolds = 10
+# Perform cross-validation
+folds = rep(1:nfolds, length.out=nrow(train.data))
+
+mean.error = 0
+for (i in 1:nfolds) {
+  testfold = train.data[folds == i,]
+  trainfold = train.data[folds != i,]
+  fit = gam(Status~BP+s(smoking,7)+behavior+age+gold_standard+s(assay,7)+s(alcohol,3), family="binomial", data=trainfold)
+  fit.pred = predict(fit, testfold, type="response")
+  fit.pred = as.numeric(fit.pred > 0.5)
+  mean.error = mean.error + mean(fit.pred == testfold$Status) / nfolds
+}
+mean.error
+```
+```{r}
+fit1 = gam(Status~BP+s(smoking,7)+behavior+age+gold_standard+s(assay,7)+s(alcohol,3), family="binomial", data=trainfold)
+anova(fit1, fit2, fit3)
+```
+
+I decided to give up on GANs because the results weren't very good. Since the data is class-based, I decided to move forward using SVMs. First, I use an SVC, tuning cost.
+
+```{r}
+library(e1071)
+
+set.seed(1)
+tune.out = tune(svm, Status~., data=train.data, kernel="linear", ranges=list(cost=c(seq(0.01, 0.1, 0.01), seq(0.2, 1, 0.1), seq(2, 10, 1))))
+optimalcost = tune.out$best.parameters
+print(sprintf("Optimal cost: %s, error: %s", optimalcost, tune.out$best.performance))
+
+```
+```{r}
+fit.linscv = svm(as.factor(Status)~., data=train.data, kernel="linear", cost=0.01)
+pred.train = predict(fit.linscv, train.data)
+print(sprintf("Training error: %s", mean(pred.train != train.data$Status)))
+pred.test = predict(fit.linscv, test.data)
+retdf = data.frame(test.data$Id, pred.test == 1)
+names(retdf) = c("Id", "Category")
+write.csv(retdf, "predictions.csv", row.names = FALSE, quote = FALSE)
+```
+Polynomial SVM, again tuning cost along an exponential distribution.
+
+```{r}
+library(e1071)
+
+set.seed(1)
+tune.out = tune(svm, Status~., data=train.data, kernel="polynomial", ranges=list(degree=1:7,cost=c(seq(0.01, 0.1, 0.01), seq(0.2, 1, 0.1), seq(2, 10, 1))))
+optimalcost = tune.out$best.parameters
+print(sprintf("Optimal cost: %s, error: %s", optimalcost, tune.out$best.performance))
+
+```
+
+```{r}
+fit.polyscm = svm(as.factor(Status)~., data=train.data, kernel="polynomial", cost=0.2)
+pred.train = predict(fit.polyscm, train.data)
+print(sprintf("Training error: %s", mean(pred.train != train.data$Status)))
+pred.test = predict(fit.polyscm, test.data)
+retdf = data.frame(test.data$Id, pred.test == 1)
+names(retdf) = c("Id", "Category")
+write.csv(retdf, "predictions.csv", row.names = FALSE, quote = FALSE)
+```
+
+Radial SVM, tuning cost exponentially again.
+
+```{r}
+library(e1071)
+
+set.seed(1)
+tune.out = tune(svm, Status~., data=train.data, kernel="radial", ranges=list(cost=c(seq(0.01, 0.1, 0.01), seq(0.2, 1, 0.1), seq(2, 10, 1))))
+optimalcost = tune.out$best.parameters
+print(sprintf("Optimal cost: %s, error: %s", optimalcost, tune.out$best.performance))
+
+```
+
+```{r}
+library(e1071)
+
+set.seed(1)
+tune.out = tune(svm, as.factor(Status)~., data=train.data, kernel="radial", ranges=list(cost=seq(0.9, 1.0, 0.01)))
+optimalcost = tune.out$best.parameters
+print(sprintf("Optimal cost: %s, error: %s", optimalcost, tune.out$best.performance))
+
+```
+
+Best error so far: 0.7 cost, default gamma
+
+```{r}
+library(e1071)
+fit.radsvm = svm(as.factor(Status)~., data=train.data, kernel="radial", cost=0.7)
+pred.train = predict(fit.radsvm, train.data)
+print(sprintf("Training error: %s", mean(pred.train != train.data$Status)))
+```
+
+```{r}
+library(e1071)
+fit.radsvm = svm(as.factor(Status)~., data=train.data, kernel="radial", cost=0.7)
+pred.train = predict(fit.radsvm, train.data)
+print(sprintf("Training error: %s", mean(pred.train != train.data$Status)))
+pred.test = predict(fit.radsvm, test.data)
+retdf = data.frame(test.data$Id, pred.test == 1)
+names(retdf) = c("Id", "Category")
+write.csv(retdf, "predictions.csv", row.names = FALSE, quote = FALSE)
+```
